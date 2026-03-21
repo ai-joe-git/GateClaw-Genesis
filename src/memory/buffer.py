@@ -3,7 +3,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 import sqlite3
 
 from models.episode import Episode, EpisodeSummary, EmotionalTone
@@ -20,11 +20,13 @@ class RawBuffer:
     Storage: SQLite for persistence, in-memory cache for speed.
     """
 
-    DEFAULT_BUFFER_SIZE = 10  # Keep last 10 conversations uncompressed
+    DEFAULT_BUFFER_SIZE: int = 10  # Keep last 10 conversations uncompressed
 
-    def __init__(self, db_path: str = "memory.db", buffer_size: int = None):
+    def __init__(
+        self, db_path: str = "memory.db", buffer_size: int = DEFAULT_BUFFER_SIZE
+    ):
         self.db_path = Path(db_path)
-        self.buffer_size = buffer_size or self.DEFAULT_BUFFER_SIZE
+        self.buffer_size = buffer_size
         self._init_db()
 
     def _init_db(self):
