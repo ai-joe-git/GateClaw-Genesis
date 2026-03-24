@@ -2,39 +2,140 @@
 
 import json
 import sqlite3
+import requests
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from dataclasses import dataclass
 import re
 
-from models.episode import Episode, EpisodeSummary, EmotionalTone
+from dataclasses import dataclass, field
+
+from models.episode import Episode, EpisodeSummary, EmotionalTone, EmotionalState
 
 
-# Keyword-based topic extraction (placeholder for more sophisticated NLP)
+def try_parse_json(content: str):
+    """Try to extract and parse valid JSON from LLM response.
+    Returns (parsed_object, None) on success or (None, error_msg) on failure.
+    """
+    # Strip markdown code blocks
+    content = content.strip()
+    if content.startswith("```"):
+        parts = content.split("```")
+        for part in parts[1:]:
+            if part.startswith("json"):
+                content = part[4:]
+                break
+            elif part.strip():
+                content = part
+                break
+
+    # Strategy: find balanced {...} by progressively shrinking from the end
+    json_start = content.find("{")
+    if json_start >= 0:
+        json_end = content.rfind("}")
+        if json_end > json_start:
+            for end_pos in range(json_end, json_start - 1, -1):
+                candidate = content[json_start : end_pos + 1]
+                try:
+                    return json.loads(candidate), None
+                except json.JSONDecodeError:
+                    continue
+
+    return None, "No valid JSON found in response"
+
+
+# llama-swap endpoint for Layer 2 summarization
+LLAMA_SWAP_URL = "http://localhost:8888/v1/chat/completions"
+SUMMARIZE_MODEL = "Nemotron-3-Nano-4B"  # Summarization model (Layer 2)
+FACTS_MODEL = "Claude-4.6-Opus-4B"  # Fact extraction model (Layer 4)
+
 TOPIC_KEYWORDS = {
-    "python": ["python", "py", "pip", "venv", "django", "flask", "fastapi"],
-    "javascript": ["javascript", "js", "node", "npm", "react", "vue", "typescript"],
-    "docker": ["docker", "container", "compose", "kubernetes", "k8s"],
-    "database": ["database", "sql", "postgres", "mysql", "mongodb", "redis"],
-    "api": ["api", "endpoint", "rest", "graphql", "request", "response"],
-    "debugging": ["debug", "error", "bug", "fix", "issue", "problem", "stack trace"],
-    "testing": ["test", "pytest", "jest", "unit", "integration", "coverage"],
-    "git": ["git", "branch", "commit", "merge", "pull request", "conflict"],
-    "deployment": ["deploy", "production", "staging", "ci/cd", "pipeline"],
-    "architecture": ["architecture", "design", "pattern", "structure", "refactor"],
+    "gateclaw": [
+        "gateclaw",
+        "genesis",
+        "memory system",
+        "persistent memory",
+        "episodic",
+    ],
+    "python": ["python", "async", "asyncio", "uvloop", "pip", "virtualenv", "venv"],
+    "typescript": ["typescript", "ts", "node", "npm", "yarn", "tsx", "deno"],
+    "opencode": ["opencode", "open code", "ide", "editor", "cursor", "vscode"],
+    "telegram": ["telegram", "bot", "chat_id", "tg", "message", "send"],
+    "docker": [
+        "docker",
+        "container",
+        "dockerfile",
+        "image",
+        "compose",
+        "kubectl",
+        "k8s",
+    ],
+    "database": [
+        "sqlite",
+        "postgres",
+        "mysql",
+        "mongodb",
+        "redis",
+        "db",
+        "query",
+        "sql",
+    ],
+    "api": ["api", "rest", "graphql", "endpoint", "http", "webhook", "json"],
+    "bug": ["bug", "crash", "error", "issue", "fix", "broken", "not working", "failed"],
+    "feature": ["feature", "new", "add", "implement", "enhancement", "improve"],
+    "deployment": [
+        "deploy",
+        "production",
+        "server",
+        "hosting",
+        "cloud",
+        "aws",
+        "azure",
+    ],
+    "testing": ["test", "testing", "unit test", "integration", "pytest", "jest"],
+    "config": [
+        "config",
+        "configuration",
+        "env",
+        ".env",
+        "settings",
+        "ini",
+        "yaml",
+        "toml",
+    ],
+    "tui": ["tui", "terminal", "console", "cli", "command line", "interface"],
+    "models": [
+        "model",
+        "llm",
+        "gpt",
+        "claude",
+        "ollama",
+        "nemotron",
+        "embedding",
+        "vector",
+    ],
 }
 
 
 @dataclass
 class CompressedEpisode:
-    """A compressed episode ready for embedding storage."""
+    """Layer 2 compressed episode — summarized representation of a raw conversation."""
 
     episode_id: str
-    summary: EpisodeSummary
+    session_id: str
+    title: str
+    summary: str
+    topics: list[str]
+    outcomes: list[str]
+    key_moments: list[str]
+    emotional_tone: EmotionalTone
+    emotional_state: EmotionalState
     created_at: datetime
-    weight: float
-    user_id: str
+    weight: float = 1.0
+    resolved: bool = False
+    revisit_count: int = 0
+    embedding: list[float] = field(default_factory=list)
 
 
 class EpisodeManager:
@@ -49,6 +150,9 @@ class EpisodeManager:
 
     def __init__(self, db_path: str = "memory.db"):
         self.db_path = Path(db_path)
+        self.LLAMA_SWAP_URL = LLAMA_SWAP_URL
+        self.SUMMARIZE_MODEL = SUMMARIZE_MODEL
+        self.FACTS_MODEL = FACTS_MODEL
         self._init_db()
 
     def _init_db(self):
@@ -74,24 +178,104 @@ class EpisodeManager:
         """
         Compress a raw episode into a structured summary.
 
-        This is where the magic happens:
-        1. Extract title from first meaningful exchange
-        2. Summarize the conversation
-        3. Extract topics using keyword matching
-        4. Identify outcomes (solutions, decisions)
-        5. Mark key moments
-
-        TODO: Replace with LLM-based summarization for better quality.
+        First tries LLM-based summarization via llama-swap, then falls back to
+        keyword-based extraction if LLM unavailable.
         """
         messages = episode.raw_messages
 
-        # Extract title from first user message (first 50 chars)
+        # Try LLM summarization first
+        llm_summary = self._llm_summarize(messages)
+        if llm_summary:
+            return llm_summary
+
+        # Fallback to keyword-based extraction
+        return self._keyword_based_compress(episode)
+
+    def _llm_summarize(self, messages: list[dict]) -> Optional[EpisodeSummary]:
+        """Call Claude-4.6-Opus-2B via llama-swap for LLM-based episode summarization."""
+        try:
+            # Format messages into readable conversation
+            conversation = "\n".join(
+                [
+                    f"{m.get('role', 'unknown').upper()}: {m.get('content', '')[:500]}"
+                    for m in messages
+                    if m.get("content")
+                ]
+            )
+
+            prompt = f"""You are a memory summarization system. Summarize this conversation into structured JSON only.
+No explanation. No markdown. No code blocks. Return only valid JSON.
+
+Output format:
+{{
+  "title": "one line description of what this conversation was about",
+  "summary": "2-3 sentences capturing what happened, what was decided, what was built",
+  "topics": ["topic1", "topic2", "topic3"],
+  "outcome": "resolved|unresolved|ongoing",
+  "key_moments": ["specific thing that happened", "specific decision made"],
+  "emotional_tone": "frustrated|neutral|productive|breakthrough|collaborative"
+}}
+
+Conversation:
+{conversation}"""
+
+            response = requests.post(
+                self.LLAMA_SWAP_URL,
+                json={
+                    "model": SUMMARIZE_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are a memory summarization system. You respond with valid JSON only. No explanation. No markdown. No text outside the JSON.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0,
+                    "max_tokens": 500,
+                    "response_format": {"type": "json_object"},
+                },
+                timeout=600,
+            )
+
+            if response.status_code == 200:
+                msg = response.json()["choices"][0]["message"]
+                content = (
+                    msg.get("content", "").strip()
+                    or msg.get("reasoning_content", "").strip()
+                )
+
+                data, err = try_parse_json(content)
+                if data is not None and isinstance(data, dict):
+                    return EpisodeSummary(
+                        title=data.get("title", "Conversation")[:50],
+                        summary=data.get("summary", ""),
+                        topics=data.get("topics", [])[:5],
+                        outcomes=data.get("key_moments", [])[:3],
+                        emotional_tone=EmotionalTone(
+                            data.get("emotional_tone", "neutral")
+                        ),
+                        key_moments=data.get("key_moments", [])[:5],
+                        entities=data.get("topics", [])[:5],
+                    )
+                else:
+                    print(f"[Genesis] LLM summarization parse failed: {err}")
+
+        except Exception as e:
+            print(f"[Genesis] LLM summarization failed: {e}")
+
+        return None
+
+    def _keyword_based_compress(self, episode: Episode) -> EpisodeSummary:
+        """Fallback keyword-based compression when LLM unavailable."""
+        messages = episode.raw_messages
+
+        # Extract title from first user message
         first_user_msg = next(
             (m["content"] for m in messages if m["role"] == "user"), "Conversation"
         )
         title = self._extract_title(first_user_msg)
 
-        # Generate summary (placeholder: key messages extraction)
+        # Generate summary
         summary = self._generate_summary(messages)
 
         # Extract topics
@@ -101,10 +285,10 @@ class EpisodeManager:
         # Extract outcomes
         outcomes = self._extract_outcomes(messages)
 
-        # Extract entities (technical terms, names)
+        # Extract entities
         entities = self._extract_entities(all_content)
 
-        # Key moments (questions asked, decisions made)
+        # Key moments
         key_moments = self._extract_key_moments(messages)
 
         return EpisodeSummary(
